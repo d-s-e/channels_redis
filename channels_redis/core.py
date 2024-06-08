@@ -1,129 +1,29 @@
 import asyncio
 import base64
-import binascii
 import collections
+import functools
 import hashlib
 import itertools
+import logging
 import random
-import string
 import time
-import types
+import uuid
 
-import aioredis
 import msgpack
+from redis import asyncio as aioredis
 
 from channels.exceptions import ChannelFull
 from channels.layers import BaseChannelLayer
 
+from .utils import (
+    _close_redis,
+    _consistent_hash,
+    _wrap_close,
+    create_pool,
+    decode_hosts,
+)
 
-def _wrap_close(loop, pool):
-    """
-    Decorate an event loop's close method with our own.
-    """
-    original_impl = loop.close
-
-    def _wrapper(self, *args, **kwargs):
-        # If the event loop was closed, there's nothing we can do anymore.
-        if not self.is_closed():
-            self.run_until_complete(pool.close_loop(self))
-        # Restore the original close() implementation after we're done.
-        self.close = original_impl
-        return self.close(*args, **kwargs)
-
-    loop.close = types.MethodType(_wrapper, loop)
-
-
-class ConnectionPool:
-    """
-    Connection pool manager for the channel layer.
-
-    It manages a set of connections for the given host specification and
-    taking into account asyncio event loops.
-    """
-
-    def __init__(self, host):
-        self.host = host
-        self.conn_map = {}
-        self.in_use = {}
-
-    def _ensure_loop(self, loop):
-        """
-        Get connection list for the specified loop.
-        """
-        if loop is None:
-            loop = asyncio.get_event_loop()
-
-        if loop not in self.conn_map:
-            # Swap the loop's close method with our own so we get
-            # a chance to do some cleanup.
-            _wrap_close(loop, self)
-            self.conn_map[loop] = []
-
-        return self.conn_map[loop], loop
-
-    async def pop(self, loop=None):
-        """
-        Get a connection for the given identifier and loop.
-        """
-        conns, loop = self._ensure_loop(loop)
-        if not conns:
-            conns.append(await aioredis.create_redis(**self.host, loop=loop))
-        conn = conns.pop()
-        self.in_use[conn] = loop
-        return conn
-
-    def push(self, conn):
-        """
-        Return a connection to the pool.
-        """
-        loop = self.in_use[conn]
-        del self.in_use[conn]
-        if loop is not None:
-            conns, _ = self._ensure_loop(loop)
-            conns.append(conn)
-
-    def conn_error(self, conn):
-        """
-        Handle a connection that produced an error.
-        """
-        conn.close()
-        del self.in_use[conn]
-
-    def reset(self):
-        """
-        Clear all connections from the pool.
-        """
-        self.conn_map = {}
-        self.in_use = {}
-
-    async def close_loop(self, loop):
-        """
-        Close all connections owned by the pool on the given loop.
-        """
-        if loop in self.conn_map:
-            for conn in self.conn_map[loop]:
-                conn.close()
-                await conn.wait_closed()
-            del self.conn_map[loop]
-
-        for k, v in self.in_use.items():
-            if v is loop:
-                self.in_use[k] = None
-
-    async def close(self):
-        """
-        Close all connections owned by the pool.
-        """
-        conn_map = self.conn_map
-        in_use = self.in_use
-        self.reset()
-        for conns in conn_map.values():
-            for conn in conns:
-                conn.close()
-                await conn.wait_closed()
-        for conn in in_use:
-            conn.close()
-            await conn.wait_closed()
+logger = logging.getLogger(__name__)
 
 
 class ChannelLock:
@@ -162,8 +62,37 @@ class ChannelLock:
             del self.wait_counts[channel]
 
 
-class UnsupportedRedis(Exception):
-    pass
+class BoundedQueue(asyncio.Queue):
+    def put_nowait(self, item):
+        if self.full():
+            # see: https://github.com/django/channels_redis/issues/212
+            # if we actually get into this code block, it likely means that
+            # this specific consumer has stopped reading
+            # if we get into this code block, it's better to drop messages
+            # that exceed the channel layer capacity than to continue to
+            # malloc() forever
+            self.get_nowait()
+        return super(BoundedQueue, self).put_nowait(item)
+
+
+class RedisLoopLayer:
+    def __init__(self, channel_layer):
+        self._lock = asyncio.Lock()
+        self.channel_layer = channel_layer
+        self._connections = {}
+
+    def get_connection(self, index):
+        if index not in self._connections:
+            pool = self.channel_layer.create_pool(index)
+            self._connections[index] = aioredis.Redis(connection_pool=pool)
+
+        return self._connections[index]
+
+    async def flush(self):
+        async with self._lock:
+            for index in list(self._connections):
+                connection = self._connections.pop(index)
+                await _close_redis(connection)
 
 
 class RedisChannelLayer(BaseChannelLayer):
@@ -180,7 +109,7 @@ class RedisChannelLayer(BaseChannelLayer):
     def __init__(
         self,
         hosts=None,
-        prefix="asgi:",
+        prefix="asgi",
         expiry=60,
         group_expiry=86400,
         capacity=100,
@@ -195,18 +124,15 @@ class RedisChannelLayer(BaseChannelLayer):
         self.prefix = prefix
         assert isinstance(self.prefix, str), "Prefix must be unicode"
         # Configure the host objects
-        self.hosts = self.decode_hosts(hosts)
+        self.hosts = decode_hosts(hosts)
         self.ring_size = len(self.hosts)
         # Cached redis connection pools and the event loop they are from
-        self.pools = [ConnectionPool(host) for host in self.hosts]
+        self._layers = {}
         # Normal channels choose a host index by cycling through the available hosts
         self._receive_index_generator = itertools.cycle(range(len(self.hosts)))
         self._send_index_generator = itertools.cycle(range(len(self.hosts)))
         # Decide on a unique client prefix to use in ! sections
-        # TODO: ensure uniqueness better, e.g. Redis keys with SETNX
-        self.client_prefix = "".join(
-            random.choice(string.ascii_letters) for i in range(8)
-        )
+        self.client_prefix = uuid.uuid4().hex
         # Set up any encryption objects
         self._setup_encryption(symmetric_encryption_keys)
         # Number of coroutines trying to receive right now
@@ -216,34 +142,17 @@ class RedisChannelLayer(BaseChannelLayer):
         # Event loop they are trying to receive on
         self.receive_event_loop = None
         # Buffered messages by process-local channel name
-        self.receive_buffer = collections.defaultdict(asyncio.Queue)
+        self.receive_buffer = collections.defaultdict(
+            functools.partial(BoundedQueue, self.capacity)
+        )
         # Detached channel cleanup tasks
         self.receive_cleaners = []
         # Per-channel cleanup locks to prevent a receive starting and moving
         # a message back into the main queue before its cleanup has completed
         self.receive_clean_locks = ChannelLock()
 
-    def decode_hosts(self, hosts):
-        """
-        Takes the value of the "hosts" argument passed to the class and returns
-        a list of kwargs to use for the Redis connection constructor.
-        """
-        # If no hosts were provided, return a default value
-        if not hosts:
-            return [{"address": ("localhost", 6379)}]
-        # If they provided just a string, scold them.
-        if isinstance(hosts, (str, bytes)):
-            raise ValueError(
-                "You must pass a list of Redis hosts, even if there is only one."
-            )
-        # Decode each hosts entry into a kwargs dict
-        result = []
-        for entry in hosts:
-            if isinstance(entry, dict):
-                result.append(entry)
-            else:
-                result.append({"address": entry})
-        return result
+    def create_pool(self, index):
+        return create_pool(self.hosts[index])
 
     def _setup_encryption(self, symmetric_encryption_keys):
         # See if we can do encryption if they asked
@@ -290,14 +199,22 @@ class RedisChannelLayer(BaseChannelLayer):
             index = self.consistent_hash(channel)
         else:
             index = next(self._send_index_generator)
-        async with self.connection(index) as connection:
-            # Check the length of the list before send
-            # This can allow the list to leak slightly over capacity, but that's fine.
-            if await connection.llen(channel_key) >= self.get_capacity(channel):
-                raise ChannelFull()
-            # Push onto the list then set it to expire in case it's not consumed
-            await connection.lpush(channel_key, self.serialize(message))
-            await connection.expire(channel_key, int(self.expiry))
+        connection = self.connection(index)
+        # Discard old messages based on expiry
+        await connection.zremrangebyscore(
+            channel_key, min=0, max=int(time.time()) - int(self.expiry)
+        )
+
+        # Check the length of the list before send
+        # This can allow the list to leak slightly over capacity, but that's fine.
+        if await connection.zcount(channel_key, "-inf", "+inf") >= self.get_capacity(
+            channel
+        ):
+            raise ChannelFull()
+
+        # Push onto the list then set it to expire in case it's not consumed
+        await connection.zadd(channel_key, {self.serialize(message): time.time()})
+        await connection.expire(channel_key, int(self.expiry))
 
     def _backup_channel_name(self, channel):
         """
@@ -314,27 +231,35 @@ class RedisChannelLayer(BaseChannelLayer):
         # of the main message queue in the proper order; BRPOP must *not* be called
         # because that would deadlock the server
         cleanup_script = """
-            local backed_up = redis.call('LRANGE', ARGV[2], 0, -1)
-            for i = #backed_up, 1, -1 do
-                redis.call('LPUSH', ARGV[1], backed_up[i])
+            local backed_up = redis.call('ZRANGE', ARGV[2], 0, -1, 'WITHSCORES')
+            for i = #backed_up, 1, -2 do
+                redis.call('ZADD', ARGV[1], backed_up[i], backed_up[i - 1])
             end
             redis.call('DEL', ARGV[2])
         """
         backup_queue = self._backup_channel_name(channel)
-        async with self.connection(index) as connection:
-            # Cancellation here doesn't matter, we're not doing anything destructive
-            # and the script executes atomically...
-            await connection.eval(cleanup_script, keys=[], args=[channel, backup_queue])
-            # ...and it doesn't matter here either, the message will be safe in the backup.
-            return await connection.brpoplpush(channel, backup_queue, timeout=timeout)
+        connection = self.connection(index)
+        # Cancellation here doesn't matter, we're not doing anything destructive
+        # and the script executes atomically...
+        await connection.eval(cleanup_script, 0, channel, backup_queue)
+        # ...and it doesn't matter here either, the message will be safe in the backup.
+        result = await connection.bzpopmin(channel, timeout=timeout)
+
+        if result is not None:
+            _, member, timestamp = result
+            await connection.zadd(backup_queue, {member: float(timestamp)})
+        else:
+            member = None
+
+        return member
 
     async def _clean_receive_backup(self, index, channel):
         """
         Pop the oldest message off the channel backup queue.
         The result isn't interesting as it was already processed.
         """
-        async with self.connection(index) as connection:
-            await connection.brpop(self._backup_channel_name(channel))
+        connection = self.connection(index)
+        await connection.zpopmin(self._backup_channel_name(channel))
 
     async def receive(self, channel):
         """
@@ -351,7 +276,7 @@ class RedisChannelLayer(BaseChannelLayer):
                 self.client_prefix + "!"
             ), "Wrong client prefix"
             # Enter receiving section
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             self.receive_count += 1
             try:
                 if self.receive_count == 1:
@@ -392,11 +317,11 @@ class RedisChannelLayer(BaseChannelLayer):
 
                         raise
 
-                    message, token, exception = None, None, None
+                    message = token = exception = None
                     for task in done:
                         try:
                             result = task.result()
-                        except Exception as error:  # NOQA
+                        except BaseException as error:  # NOQA
                             # We should not propagate exceptions immediately as otherwise this may cause
                             # the lock to be held and never be released.
                             exception = error
@@ -428,13 +353,13 @@ class RedisChannelLayer(BaseChannelLayer):
                             message_channel, message = await self.receive_single(
                                 real_channel
                             )
-                            if type(message_channel) is list:
+                            if isinstance(message_channel, list):
                                 for chan in message_channel:
                                     self.receive_buffer[chan].put_nowait(message)
                             else:
                                 self.receive_buffer[message_channel].put_nowait(message)
                             message = None
-                        except:
+                        except Exception:
                             del self.receive_buffer[channel]
                             raise
                         finally:
@@ -502,7 +427,7 @@ class RedisChannelLayer(BaseChannelLayer):
 
             cleaner.add_done_callback(_cleanup_done)
 
-        except Exception:
+        except BaseException:
             self.receive_clean_locks.release(channel_key)
             raise
 
@@ -520,12 +445,7 @@ class RedisChannelLayer(BaseChannelLayer):
         Returns a new channel name that can be used by something in our
         process as a specific channel.
         """
-        # TODO: Guarantee uniqueness better?
-        return "%s.%s!%s" % (
-            prefix,
-            self.client_prefix,
-            "".join(random.choice(string.ascii_letters) for i in range(12)),
-        )
+        return f"{prefix}.{self.client_prefix}!{uuid.uuid4().hex}"
 
     ### Flush extension ###
 
@@ -546,8 +466,8 @@ class RedisChannelLayer(BaseChannelLayer):
         """
         # Go through each connection and remove all with prefix
         for i in range(self.ring_size):
-            async with self.connection(i) as connection:
-                await connection.eval(delete_prefix, keys=[], args=[self.prefix + "*"])
+            connection = self.connection(i)
+            await connection.eval(delete_prefix, 0, self.prefix + "*")
         # Now clear the pools as well
         await self.close_pools()
 
@@ -558,9 +478,8 @@ class RedisChannelLayer(BaseChannelLayer):
         # Flush all cleaners, in case somebody just wanted to close the
         # pools without flushing first.
         await self.wait_received()
-
-        for pool in self.pools:
-            await pool.close()
+        for layer in self._layers.values():
+            await layer.flush()
 
     async def wait_received(self):
         """
@@ -580,12 +499,12 @@ class RedisChannelLayer(BaseChannelLayer):
         assert self.valid_channel_name(channel), "Channel name not valid"
         # Get a connection to the right shard
         group_key = self._group_key(group)
-        async with self.connection(self.consistent_hash(group)) as connection:
-            # Add to group sorted set with creation time as timestamp
-            await connection.zadd(group_key, time.time(), channel)
-            # Set expiration to be group_expiry, since everything in
-            # it at this point is guaranteed to expire before that
-            await connection.expire(group_key, self.group_expiry)
+        connection = self.connection(self.consistent_hash(group))
+        # Add to group sorted set with creation time as timestamp
+        await connection.zadd(group_key, {channel: time.time()})
+        # Set expiration to be group_expiry, since everything in
+        # it at this point is guaranteed to expire before that
+        await connection.expire(group_key, self.group_expiry)
 
     async def group_discard(self, group, channel):
         """
@@ -595,8 +514,8 @@ class RedisChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), "Group name not valid"
         assert self.valid_channel_name(channel), "Channel name not valid"
         key = self._group_key(group)
-        async with self.connection(self.consistent_hash(group)) as connection:
-            await connection.zrem(key, channel)
+        connection = self.connection(self.consistent_hash(group))
+        await connection.zrem(key, channel)
 
     async def group_send(self, group, message):
         """
@@ -605,38 +524,48 @@ class RedisChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), "Group name not valid"
         # Retrieve list of all channel names
         key = self._group_key(group)
-        async with self.connection(self.consistent_hash(group)) as connection:
-            # Discard old channels based on group_expiry
-            await connection.zremrangebyscore(
-                key, min=0, max=int(time.time()) - self.group_expiry
-            )
-
-            channel_names = [
-                x.decode("utf8") for x in await connection.zrange(key, 0, -1)
-            ]
-
-        connection_to_channel_keys, channel_keys_to_message, channel_keys_to_capacity = self._map_channel_keys_to_connection(
-            channel_names, message
+        connection = self.connection(self.consistent_hash(group))
+        # Discard old channels based on group_expiry
+        await connection.zremrangebyscore(
+            key, min=0, max=int(time.time()) - self.group_expiry
         )
 
+        channel_names = [x.decode("utf8") for x in await connection.zrange(key, 0, -1)]
+
+        (
+            connection_to_channel_keys,
+            channel_keys_to_message,
+            channel_keys_to_capacity,
+        ) = self._map_channel_keys_to_connection(channel_names, message)
+
         for connection_index, channel_redis_keys in connection_to_channel_keys.items():
+            # Discard old messages based on expiry
+            pipe = connection.pipeline()
+            for key in channel_redis_keys:
+                pipe.zremrangebyscore(
+                    key, min=0, max=int(time.time()) - int(self.expiry)
+                )
+            await pipe.execute()
 
             # Create a LUA script specific for this connection.
             # Make sure to use the message specific to this channel, it is
             # stored in channel_to_message dict and contains the
             # __asgi_channel__ key.
 
-            group_send_lua = (
-                """
-                    for i=1,#KEYS do
-                        if redis.call('LLEN', KEYS[i]) < tonumber(ARGV[i + #KEYS]) then
-                            redis.call('LPUSH', KEYS[i], ARGV[i])
-                            redis.call('EXPIRE', KEYS[i], %d)
-                        end
+            group_send_lua = """
+                local over_capacity = 0
+                local current_time = ARGV[#ARGV - 1]
+                local expiry = ARGV[#ARGV]
+                for i=1,#KEYS do
+                    if redis.call('ZCOUNT', KEYS[i], '-inf', '+inf') < tonumber(ARGV[i + #KEYS]) then
+                        redis.call('ZADD', KEYS[i], current_time, ARGV[i])
+                        redis.call('EXPIRE', KEYS[i], expiry)
+                    else
+                        over_capacity = over_capacity + 1
                     end
-                    """
-                % self.expiry
-            )
+                end
+                return over_capacity
+            """
 
             # We need to filter the messages to keep those related to the connection
             args = [
@@ -650,46 +579,20 @@ class RedisChannelLayer(BaseChannelLayer):
                 for channel_key in channel_redis_keys
             ]
 
+            args += [time.time(), self.expiry]
+
             # channel_keys does not contain a single redis key more than once
-            async with self.connection(connection_index) as connection:
-                await connection.eval(
-                    group_send_lua, keys=channel_redis_keys, args=args
+            connection = self.connection(connection_index)
+            channels_over_capacity = await connection.eval(
+                group_send_lua, len(channel_redis_keys), *channel_redis_keys, *args
+            )
+            if channels_over_capacity > 0:
+                logger.info(
+                    "%s of %s channels over capacity in group %s",
+                    channels_over_capacity,
+                    len(channel_names),
+                    group,
                 )
-
-    def _map_channel_to_connection(self, channel_names, message):
-        """
-        For a list of channel names, bucket each one to a dict keyed by the
-        connection index
-        Also for each channel create a message specific to that channel, adding
-        the __asgi_channel__ key to the message
-        We also return a mapping from channel names to their corresponding Redis
-        keys, and a mapping of channels to their capacity
-        """
-        connection_to_channels = collections.defaultdict(list)
-        channel_to_message = dict()
-        channel_to_capacity = dict()
-        channel_to_key = dict()
-
-        for channel in channel_names:
-            channel_non_local_name = channel
-            if "!" in channel:
-                message = dict(message.items())
-                message["__asgi_channel__"] = channel
-                channel_non_local_name = self.non_local_name(channel)
-            channel_key = self.prefix + channel_non_local_name
-            idx = self.consistent_hash(channel_non_local_name)
-            connection_to_channels[idx].append(channel_key)
-            channel_to_capacity[channel] = self.get_capacity(channel)
-            channel_to_message[channel] = self.serialize(message)
-            # We build a
-            channel_to_key[channel] = channel_key
-
-        return (
-            connection_to_channels,
-            channel_to_message,
-            channel_to_capacity,
-            channel_to_key,
-        )
 
     def _map_channel_keys_to_connection(self, channel_names, message):
         """
@@ -718,7 +621,7 @@ class RedisChannelLayer(BaseChannelLayer):
             # Get its redis key
             channel_key = self.prefix + channel_non_local_name
             # Have we come across the same redis key?
-            if channel_key not in channel_key_to_message.keys():
+            if channel_key not in channel_key_to_message:
                 # If not, fill the corresponding dicts
                 message = dict(message.items())
                 message["__asgi_channel__"] = [channel]
@@ -731,9 +634,9 @@ class RedisChannelLayer(BaseChannelLayer):
                 channel_key_to_message[channel_key]["__asgi_channel__"].append(channel)
 
         # Now that we know what message needs to be send on a redis key we serialize it
-        for key in channel_key_to_message.keys():
+        for key, value in channel_key_to_message.items():
             # Serialize the message stored for each redis key
-            channel_key_to_message[key] = self.serialize(channel_key_to_message[key])
+            channel_key_to_message[key] = self.serialize(value)
 
         return (
             connection_to_channel_keys,
@@ -745,7 +648,7 @@ class RedisChannelLayer(BaseChannelLayer):
         """
         Common function to make the storage key for the group.
         """
-        return ("%s:group:%s" % (self.prefix, group)).encode("utf8")
+        return f"{self.prefix}:group:{group}".encode("utf8")
 
     ### Serialization ###
 
@@ -756,12 +659,18 @@ class RedisChannelLayer(BaseChannelLayer):
         value = msgpack.packb(message, use_bin_type=True)
         if self.crypter:
             value = self.crypter.encrypt(value)
-        return value
+
+        # As we use an sorted set to expire messages we need to guarantee uniqueness, with 12 bytes.
+        random_prefix = random.getrandbits(8 * 12).to_bytes(12, "big")
+        return random_prefix + value
 
     def deserialize(self, message):
         """
         Deserializes from a byte string.
         """
+        # Removes the random prefix
+        message = message[12:]
+
         if self.crypter:
             message = self.crypter.decrypt(message, self.expiry + 10)
         return msgpack.unpackb(message, raw=False)
@@ -769,15 +678,7 @@ class RedisChannelLayer(BaseChannelLayer):
     ### Internal functions ###
 
     def consistent_hash(self, value):
-        """
-        Maps the value to a node value between 0 and 4095
-        using CRC, then down to one of the ring nodes.
-        """
-        if isinstance(value, str):
-            value = value.encode("utf8")
-        bigval = binascii.crc32(value) & 0xFFF
-        ring_divisor = 4096 / float(self.ring_size)
-        return int(bigval / ring_divisor)
+        return _consistent_hash(value, self.ring_size)
 
     def make_fernet(self, key):
         """
@@ -791,7 +692,7 @@ class RedisChannelLayer(BaseChannelLayer):
         return Fernet(formatted_key)
 
     def __str__(self):
-        return "%s(hosts=%s)" % (self.__class__.__name__, self.hosts)
+        return f"{self.__class__.__name__}(hosts={self.hosts})"
 
     ### Connection handling ###
 
@@ -803,26 +704,14 @@ class RedisChannelLayer(BaseChannelLayer):
         # Catch bad indexes
         if not 0 <= index < self.ring_size:
             raise ValueError(
-                "There are only %s hosts - you asked for %s!" % (self.ring_size, index)
+                f"There are only {self.ring_size} hosts - you asked for {index}!"
             )
-        # Make a context manager
-        return self.ConnectionContextManager(self.pools[index])
 
-    class ConnectionContextManager:
-        """
-        Async context manager for connections
-        """
+        loop = asyncio.get_running_loop()
+        try:
+            layer = self._layers[loop]
+        except KeyError:
+            _wrap_close(self, loop)
+            layer = self._layers[loop] = RedisLoopLayer(self)
 
-        def __init__(self, pool):
-            self.pool = pool
-
-        async def __aenter__(self):
-            self.conn = await self.pool.pop()
-            return self.conn
-
-        async def __aexit__(self, exc_type, exc, tb):
-            if exc:
-                self.pool.conn_error(self.conn)
-            else:
-                self.pool.push(self.conn)
-            self.conn = None
+        return layer.get_connection(index)

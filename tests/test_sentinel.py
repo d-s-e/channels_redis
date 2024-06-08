@@ -7,19 +7,77 @@ import pytest
 from asgiref.sync import async_to_sync
 from channels_redis.core import ChannelFull, RedisChannelLayer
 
-TEST_HOSTS = ["redis://localhost:6379"]
+SENTINEL_MASTER = "sentinel"
+SENTINEL_KWARGS = {"password": "channels_redis"}
 
+TEST_HOSTS = [
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+    }
+]
 MULTIPLE_TEST_HOSTS = [
-    "redis://localhost:6379/0",
-    "redis://localhost:6379/1",
-    "redis://localhost:6379/2",
-    "redis://localhost:6379/3",
-    "redis://localhost:6379/4",
-    "redis://localhost:6379/5",
-    "redis://localhost:6379/6",
-    "redis://localhost:6379/7",
-    "redis://localhost:6379/8",
-    "redis://localhost:6379/9",
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 0,
+    },
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 1,
+    },
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 2,
+    },
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 3,
+    },
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 4,
+    },
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 5,
+    },
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 6,
+    },
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 7,
+    },
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 8,
+    },
+    {
+        "sentinels": [("localhost", 26379)],
+        "master_name": SENTINEL_MASTER,
+        "sentinel_kwargs": SENTINEL_KWARGS,
+        "db": 9,
+    },
 ]
 
 
@@ -143,7 +201,9 @@ async def test_send_specific_capacity(channel_layer):
     Makes sure we get ChannelFull when we hit the send capacity on a specific channel
     """
     custom_channel_layer = RedisChannelLayer(
-        hosts=TEST_HOSTS, capacity=3, channel_capacity={"one": 1}
+        hosts=TEST_HOSTS,
+        capacity=3,
+        channel_capacity={"one": 1},
     )
     await custom_channel_layer.send("one", {"type": "test.message"})
     with pytest.raises(ChannelFull):
@@ -399,24 +459,6 @@ async def test_group_send_capacity_multiple_channels(channel_layer, caplog):
         assert (
             record.getMessage() == "1 of 2 channels over capacity in group test-group"
         )
-
-
-def test_repeated_group_send_with_async_to_sync(channel_layer):
-    """
-    Makes sure repeated group_send calls wrapped in async_to_sync
-    process-local channel names.
-    """
-    channel_layer = RedisChannelLayer(hosts=TEST_HOSTS, capacity=3)
-
-    try:
-        async_to_sync(channel_layer.group_send)(
-            "channel_name_1", {"type": "test.message.1"}
-        )
-        async_to_sync(channel_layer.group_send)(
-            "channel_name_2", {"type": "test.message.2"}
-        )
-    except RuntimeError as exc:
-        pytest.fail(f"repeated async_to_sync wrapped group_send calls raised {exc}")
 
 
 @pytest.mark.xfail(
